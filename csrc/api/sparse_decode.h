@@ -193,7 +193,8 @@ sparse_attn_decode_interface(
     const std::optional<at::Tensor> &extra_indices,
     const std::optional<at::Tensor> &extra_topk_length,
     int d_v,
-    float sm_scale
+    float sm_scale,
+    const std::optional<at::Tensor> &scheduler_valid_count
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -254,6 +255,7 @@ sparse_attn_decode_interface(
     KU_CHECK_DEVICE(extra_kv);
     KU_CHECK_DEVICE(extra_indices);
     KU_CHECK_DEVICE(extra_topk_length);
+    KU_CHECK_DEVICE(scheduler_valid_count);
 
     // Check data type
     KU_CHECK_DTYPE(q, torch::kBFloat16);
@@ -268,6 +270,7 @@ sparse_attn_decode_interface(
     KU_CHECK_DTYPE(num_splits, torch::kInt32);
     KU_CHECK_DTYPE(extra_indices, torch::kInt32);
     KU_CHECK_DTYPE(extra_topk_length, torch::kInt32);
+    KU_CHECK_DTYPE(scheduler_valid_count, torch::kInt32);
     
     // Check layout
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
@@ -282,6 +285,7 @@ sparse_attn_decode_interface(
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_kv);
     KU_CHECK_LAST_DIM_CONTIGUOUS(extra_indices);
     KU_CHECK_CONTIGUOUS(extra_topk_length);
+    KU_CHECK_CONTIGUOUS(scheduler_valid_count);
     
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
@@ -308,6 +312,11 @@ sparse_attn_decode_interface(
     KU_CHECK_SHAPE(attn_sink, h_q);
     KU_CHECK_SHAPE(extra_indices, b, s_q, extra_topk);
     KU_CHECK_SHAPE(extra_topk_length, b);
+    if (scheduler_valid_count.has_value()) {
+        TORCH_CHECK(
+            scheduler_valid_count->numel() == 1,
+            "scheduler_valid_count must be a scalar tensor with one element");
+    }
 
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
@@ -416,12 +425,27 @@ sparse_attn_decode_interface(
 
     // Get MLA metadata if necessary
     at::Tensor o_accum, lse_accum;
-    if (!tile_scheduler_metadata.has_value()) {
+    TORCH_CHECK(
+        tile_scheduler_metadata.has_value() == num_splits.has_value(),
+        "tile_scheduler_metadata and num_splits must be both provided or both omitted");
+    bool need_init_scheduler_metadata = !tile_scheduler_metadata.has_value();
+    if (need_init_scheduler_metadata) {
         tile_scheduler_metadata = torch::empty({impl_meta.num_sm_parts, sizeof(DecodingSchedMeta)/4}, opts.dtype(torch::kInt32));
         num_splits = torch::empty({b+1}, opts.dtype(torch::kInt32));
         KU_CHECK_CONTIGUOUS(tile_scheduler_metadata);
         KU_CHECK_CONTIGUOUS(num_splits);
+    }
 
+    KU_CHECK_DEVICE(tile_scheduler_metadata);
+    KU_CHECK_DEVICE(num_splits);
+    KU_CHECK_DTYPE(tile_scheduler_metadata, torch::kInt32);
+    KU_CHECK_DTYPE(num_splits, torch::kInt32);
+    KU_CHECK_CONTIGUOUS(tile_scheduler_metadata);
+    KU_CHECK_CONTIGUOUS(num_splits);
+    KU_CHECK_SHAPE(tile_scheduler_metadata, impl_meta.num_sm_parts, sizeof(DecodingSchedMeta)/sizeof(int));
+    KU_CHECK_SHAPE(num_splits, b+1);
+
+    if (need_init_scheduler_metadata || scheduler_valid_count.has_value()) {
         GetDecodeSchedMetaParams get_sched_meta_params = {
             b, s_q,
             impl_meta.block_size_topk,
@@ -430,6 +454,7 @@ sparse_attn_decode_interface(
             extra_topk,
             ku::get_optional_tensor_ptr<int>(topk_length),
             ku::get_optional_tensor_ptr<int>(extra_topk_length),
+            ku::get_optional_tensor_ptr<int>(scheduler_valid_count),
             nullptr,
             (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr(),
             num_splits->data_ptr<int>(),
@@ -439,14 +464,6 @@ sparse_attn_decode_interface(
         smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
     }
     // Stick the metadata pointers to `params`
-    KU_CHECK_DEVICE(tile_scheduler_metadata);
-    KU_CHECK_DEVICE(num_splits);
-    KU_CHECK_DTYPE(tile_scheduler_metadata, torch::kInt32);
-    KU_CHECK_DTYPE(num_splits, torch::kInt32);
-    KU_CHECK_CONTIGUOUS(tile_scheduler_metadata);
-    KU_CHECK_CONTIGUOUS(num_splits);
-    KU_CHECK_SHAPE(tile_scheduler_metadata, impl_meta.num_sm_parts, sizeof(DecodingSchedMeta)/sizeof(int));
-    KU_CHECK_SHAPE(num_splits, b+1);
     params.tile_scheduler_metadata_ptr = (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr();
     params.num_splits_ptr = num_splits->data_ptr<int>();
     params.num_sm_parts = impl_meta.num_sm_parts;

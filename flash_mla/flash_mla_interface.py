@@ -66,7 +66,8 @@ def flash_mla_with_kvcache(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
-    extra_topk_length: Optional[torch.Tensor] = None
+    extra_topk_length: Optional[torch.Tensor] = None,
+    scheduler_valid_count: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -88,6 +89,7 @@ def flash_mla_with_kvcache(
         attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
+        scheduler_valid_count: optional CUDA int32 scalar tensor. If provided, only the leading scheduler_valid_count rows are scheduled. This is intended for CUDA graph replay with padded batch rows.
     
     For DeepSeek V3, DeepSeek V3.1, and DeepSeek V3.2:
         head_dim should be 576 while head_dim_v should be 512.
@@ -156,11 +158,11 @@ def flash_mla_with_kvcache(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
             extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
-            head_dim_v, softmax_scale
+            head_dim_v, softmax_scale, scheduler_valid_count
         )
     else:
         # Dense attention
-        assert indices_in_kvcache is None and attn_sink is None and extra_k_cache is None and extra_indices_in_kvcache is None and topk_length is None and extra_topk_length is None, "indices_in_kvcache, attn_sink, extra_k_cache, extra_indices_in_kvcache, topk_length and extra_topk_length must be None when dense attention is used."
+        assert indices_in_kvcache is None and attn_sink is None and extra_k_cache is None and extra_indices_in_kvcache is None and topk_length is None and extra_topk_length is None and scheduler_valid_count is None, "indices_in_kvcache, attn_sink, extra_k_cache, extra_indices_in_kvcache, topk_length, extra_topk_length and scheduler_valid_count must be None when dense attention is used."
         assert block_table is not None and cache_seqlens is not None, "block_table and cache_seqlens must be provided when dense attention is used."
         out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.dense_decode_fwd(
             q, k_cache, head_dim_v,

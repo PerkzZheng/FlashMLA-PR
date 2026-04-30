@@ -104,6 +104,7 @@ dense_attn_decode_interface(
             5,
             -1, -1,
             nullptr, nullptr,
+            nullptr,
             seqlens_k.data_ptr<int>(),
             (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr(),
             num_splits->data_ptr<int>(),

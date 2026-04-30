@@ -132,6 +132,7 @@ struct GetDecodeSchedMetaParams {
 
     int topk, extra_topk;   // -1 if sparse attention (or extra topk) is disabled
     int *__restrict__ topk_length, *__restrict__ extra_topk_length;
+    int *__restrict__ scheduler_valid_count;  // Optional scalar [1], valid rows are a prefix.
 
     int *__restrict__ seqlens_k_ptr;    // Only necessary for dense attention
 

@@ -17,6 +17,10 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
     int block_size_n = params.block_size_n;
     int fixed_overhead_num_blocks = params.fixed_overhead_num_blocks;
     int num_sm_parts = params.num_sm_parts;
+    int effective_batch_size = batch_size;
+    if (params.scheduler_valid_count != nullptr) {
+        effective_batch_size = max(0, min(__ldg(params.scheduler_valid_count), batch_size));
+    }
 
     extern __shared__ int shared_mem[];
     int* num_blocks_shared = shared_mem; // [batch_size]
@@ -27,8 +31,11 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
 
     int total_num_blocks = 0;
     for (int i = threadIdx.x; i < batch_size; i += 32) {
+        bool is_valid_req = i < effective_batch_size;
         int cur_s_k;
-        if (params.topk == -1) {
+        if (!is_valid_req) {
+            cur_s_k = 0;
+        } else if (params.topk == -1) {
             // Dense model, cur_s_k = actual s_k
             cur_s_k = __ldg(seqlens_k_ptr + i);
         } else {
@@ -48,7 +55,9 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
         // NOTE Should attend to tokens [first_token_idx, last_token_idx], i.e. blocks [cur_first_block_idx, cur_last_block_idx]
         // NOTE if seqlens_k is 0, then first_token_idx == last_token_idx == cur_first_block_idx == cur_last_block_idx == 0. So the sequence will have 1 block. We will correct this later in this kernel.
         int num_blocks = cur_last_block_idx - cur_first_block_idx + 1;
-        total_num_blocks += num_blocks + fixed_overhead_num_blocks;
+        if (is_valid_req) {
+            total_num_blocks += num_blocks + fixed_overhead_num_blocks;
+        }
         num_blocks_shared[i] = num_blocks;
         first_block_idx_shared[i] = cur_first_block_idx;
         last_block_idx_shared[i] = cur_last_block_idx;
@@ -65,12 +74,24 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
         num_splits_shared[0] = 0;
         for (int i = 0; i < num_sm_parts; ++i) {
             DecodingSchedMeta cur_meta;
+            if (now_req_idx >= effective_batch_size) {
+                cur_meta.begin_req_idx = batch_size;
+                cur_meta.end_req_idx = batch_size;
+                cur_meta.begin_block_idx = 0;
+                cur_meta.end_block_idx = 0;
+                cur_meta.begin_split_idx = 0;
+                cur_meta.is_first_req_splitted = 0;
+                cur_meta.is_last_req_splitted = 0;
+                tile_scheduler_metadata_ptr[i] = cur_meta;
+                continue;
+            }
+
             cur_meta.begin_req_idx = now_req_idx;
             cur_meta.begin_block_idx = now_block + first_block_idx_shared[now_req_idx];
             cur_meta.begin_split_idx = now_n_split_idx;
             cur_meta.is_first_req_splitted = (now_block != 0);
             int remain_payload = payload;
-            while (now_req_idx < batch_size) {
+            while (now_req_idx < effective_batch_size) {
                 int num_blocks = num_blocks_shared[now_req_idx];
                 int now_remain_blocks = num_blocks - now_block;
                 if (remain_payload >= now_remain_blocks + fixed_overhead_num_blocks) {
@@ -97,7 +118,10 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
             }
             tile_scheduler_metadata_ptr[i] = cur_meta;
         }
-        FLASH_DEVICE_ASSERT(now_req_idx == batch_size && now_block == 0 && now_n_split_idx == 0);
+        for (int i = effective_batch_size; i < batch_size; ++i) {
+            num_splits_shared[i + 1] = cum_num_splits;
+        }
+        FLASH_DEVICE_ASSERT(now_req_idx == effective_batch_size && now_block == 0 && now_n_split_idx == 0);
     }
     __syncwarp();
 
